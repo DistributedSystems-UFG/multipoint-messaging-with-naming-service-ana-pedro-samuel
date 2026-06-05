@@ -134,14 +134,14 @@ class NamingServiceClient(object):
 
 
 class NamingServiceServer(object):
-    def __init__(self, host: str = SERVICE_NAMES_ADDR, port: int = SERVICE_NAMES_TCP_PORT):
-        self.host = host
+    def __init__(self, bind_host: str = "0.0.0.0", port: int = SERVICE_NAMES_TCP_PORT):
+        self.bind_host = bind_host
         self.port = port
         self.records = {}  # type: Dict[str, NamingRecord]
 
         self.server_sock = socket(AF_INET, SOCK_STREAM)
         self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.server_sock.bind((self.host, self.port))
+        self.server_sock.bind((self.bind_host, self.port))
         self.server_sock.listen(32)
 
     def _handle_bind(self, req: Dict[str, Any]) -> Dict[str, Any]:
@@ -244,7 +244,7 @@ class NamingServiceServer(object):
                 pass
 
     def run(self) -> None:
-        print("[NamingService] Listening on %s:%d" % (self.host, self.port))
+        print("[NamingService] Listening on %s:%d" % (self.bind_host, self.port))
         try:
             while True:
                 conn, _ = self.server_sock.accept()
