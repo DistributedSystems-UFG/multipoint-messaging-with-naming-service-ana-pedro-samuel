@@ -1,15 +1,12 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, SHUT_WR, socket
+from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, socket
 import pickle
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from constMP import SERVICE_NAMES_ADDR, SERVICE_NAMES_TCP_PORT
 
 
 def _read_all(sock) -> bytes:
-    chunks: list[bytes] = []
+    chunks = []
     while True:
         data = sock.recv(4096)
         if not data:
@@ -29,23 +26,27 @@ def _recv_pickle(conn) -> Any:
     return pickle.loads(raw)
 
 
-def split_endpoint(endpoint: str) -> tuple[str, int]:
+def split_endpoint(endpoint: str) -> Tuple[str, int]:
     if ":" not in endpoint:
-        raise ValueError(f"Invalid endpoint format: {endpoint!r}")
+        raise ValueError("Invalid endpoint format: %r" % endpoint)
+
     host, port_text = endpoint.rsplit(":", 1)
     if not host:
-        raise ValueError(f"Invalid endpoint host: {endpoint!r}")
+        raise ValueError("Invalid endpoint host: %r" % endpoint)
+
     try:
         port = int(port_text)
-    except ValueError as exc:
-        raise ValueError(f"Invalid endpoint port: {endpoint!r}") from exc
+    except ValueError:
+        raise ValueError("Invalid endpoint port: %r" % endpoint)
+
     if port <= 0 or port > 65535:
-        raise ValueError(f"Invalid endpoint port: {endpoint!r}")
+        raise ValueError("Invalid endpoint port: %r" % endpoint)
+
     return host, port
 
 
 def compose_endpoint(host: str, port: int) -> str:
-    return f"{host}:{port}"
+    return "%s:%d" % (host, port)
 
 
 def detect_local_ip(remote_host: str = SERVICE_NAMES_ADDR, remote_port: int = SERVICE_NAMES_TCP_PORT) -> str:
@@ -57,23 +58,23 @@ def detect_local_ip(remote_host: str = SERVICE_NAMES_ADDR, remote_port: int = SE
             return "127.0.0.1"
 
 
-@dataclass(slots=True)
-class NamingRecord:
-    name: str
-    address: str
-    service_type: str | None = None
+class NamingRecord(object):
+    def __init__(self, name: str, address: str, service_type: Optional[str] = None):
+        self.name = name
+        self.address = address
+        self.service_type = service_type
 
 
-class NamingServiceClient:
+class NamingServiceClient(object):
     def __init__(self, host: str = SERVICE_NAMES_ADDR, port: int = SERVICE_NAMES_TCP_PORT):
         self.host = host
         self.port = port
 
-    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         with socket(AF_INET, SOCK_STREAM) as sock:
             sock.connect((self.host, self.port))
             sock.sendall(pickle.dumps(payload))
-            sock.shutdown(SHUT_WR)
+            sock.shutdown(1)
             response_raw = _read_all(sock)
 
         if not response_raw:
@@ -86,7 +87,7 @@ class NamingServiceClient:
         return response
 
     @staticmethod
-    def _ensure_ok(response: dict[str, Any]) -> dict[str, Any]:
+    def _ensure_ok(response: Dict[str, Any]) -> Dict[str, Any]:
         if response.get("status") != "ok":
             message = response.get("mensagem", "Unknown naming service error.")
             raise RuntimeError(message)
@@ -112,7 +113,7 @@ class NamingServiceClient:
         response = self._request({"op": "register", "nome": name, "tipo": service_type})
         self._ensure_ok(response)
 
-    def discover(self, service_type: str) -> list[dict[str, str]]:
+    def discover(self, service_type: str) -> List[Dict[str, str]]:
         response = self._request({"op": "discover", "tipo": service_type})
         response = self._ensure_ok(response)
 
@@ -120,7 +121,7 @@ class NamingServiceClient:
         if not isinstance(records, list):
             raise RuntimeError("Naming Service returned an invalid discovery list.")
 
-        normalized: list[dict[str, str]] = []
+        normalized = []
         for record in records:
             if not isinstance(record, dict):
                 continue
@@ -132,18 +133,18 @@ class NamingServiceClient:
         return normalized
 
 
-class NamingServiceServer:
+class NamingServiceServer(object):
     def __init__(self, host: str = SERVICE_NAMES_ADDR, port: int = SERVICE_NAMES_TCP_PORT):
         self.host = host
         self.port = port
-        self.records: dict[str, NamingRecord] = {}
+        self.records = {}  # type: Dict[str, NamingRecord]
 
         self.server_sock = socket(AF_INET, SOCK_STREAM)
         self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
         self.server_sock.bind((self.host, self.port))
         self.server_sock.listen(32)
 
-    def _handle_bind(self, req: dict[str, Any]) -> dict[str, Any]:
+    def _handle_bind(self, req: Dict[str, Any]) -> Dict[str, Any]:
         name = req.get("nome")
         address = req.get("endereco")
 
@@ -152,34 +153,34 @@ class NamingServiceServer:
         if not isinstance(address, str) or not address.strip():
             return {"status": "erro", "mensagem": "Endereço inválido."}
         if name in self.records:
-            return {"status": "erro", "mensagem": f"O nome {name!r} já está registrado."}
+            return {"status": "erro", "mensagem": "O nome %r já está registrado." % name}
 
         self.records[name] = NamingRecord(name=name, address=address)
         return {"status": "ok"}
 
-    def _handle_lookup(self, req: dict[str, Any]) -> dict[str, Any]:
+    def _handle_lookup(self, req: Dict[str, Any]) -> Dict[str, Any]:
         name = req.get("nome")
         if not isinstance(name, str) or not name.strip():
             return {"status": "erro", "mensagem": "Nome inválido."}
 
         record = self.records.get(name)
         if record is None:
-            return {"status": "erro", "mensagem": f"O nome {name!r} não existe."}
+            return {"status": "erro", "mensagem": "O nome %r não existe." % name}
 
         return {"status": "ok", "endereco": record.address}
 
-    def _handle_unbind(self, req: dict[str, Any]) -> dict[str, Any]:
+    def _handle_unbind(self, req: Dict[str, Any]) -> Dict[str, Any]:
         name = req.get("nome")
         if not isinstance(name, str) or not name.strip():
             return {"status": "erro", "mensagem": "Nome inválido."}
 
         if name not in self.records:
-            return {"status": "erro", "mensagem": f"O nome {name!r} não existe."}
+            return {"status": "erro", "mensagem": "O nome %r não existe." % name}
 
         del self.records[name]
         return {"status": "ok"}
 
-    def _handle_register(self, req: dict[str, Any]) -> dict[str, Any]:
+    def _handle_register(self, req: Dict[str, Any]) -> Dict[str, Any]:
         name = req.get("nome")
         service_type = req.get("tipo")
 
@@ -190,24 +191,30 @@ class NamingServiceServer:
 
         record = self.records.get(name)
         if record is None:
-            return {"status": "erro", "mensagem": f"O nome {name!r} não existe."}
+            return {"status": "erro", "mensagem": "O nome %r não existe." % name}
 
         record.service_type = service_type
         return {"status": "ok"}
 
-    def _handle_discover(self, req: dict[str, Any]) -> dict[str, Any]:
+    def _handle_discover(self, req: Dict[str, Any]) -> Dict[str, Any]:
         service_type = req.get("tipo")
         if not isinstance(service_type, str) or not service_type.strip():
             return {"status": "erro", "mensagem": "Tipo inválido."}
 
-        records = [
-            {"nome": record.name, "endereco": record.address, "tipo": record.service_type or ""}
-            for record in sorted(self.records.values(), key=lambda item: item.name)
-            if record.service_type == service_type
-        ]
+        records = []
+        for record in sorted(self.records.values(), key=lambda item: item.name):
+            if record.service_type == service_type:
+                records.append(
+                    {
+                        "nome": record.name,
+                        "endereco": record.address,
+                        "tipo": record.service_type or "",
+                    }
+                )
+
         return {"status": "ok", "registros": records}
 
-    def _dispatch(self, req: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch(self, req: Dict[str, Any]) -> Dict[str, Any]:
         op = req.get("op")
         if op == "bind":
             return self._handle_bind(req)
@@ -219,7 +226,7 @@ class NamingServiceServer:
             return self._handle_register(req)
         if op == "discover":
             return self._handle_discover(req)
-        return {"status": "erro", "mensagem": f"Operação desconhecida: {op!r}"}
+        return {"status": "erro", "mensagem": "Operação desconhecida: %r" % op}
 
     def _handle_connection(self, conn) -> None:
         try:
@@ -230,14 +237,14 @@ class NamingServiceServer:
 
             response = self._dispatch(req)
             _send_pickle(conn, response)
-        except Exception as exc:  # pragma: no cover - defensive server-side guard
+        except Exception as exc:
             try:
                 _send_pickle(conn, {"status": "erro", "mensagem": str(exc)})
             except Exception:
                 pass
 
     def run(self) -> None:
-        print(f"[NamingService] Listening on {self.host}:{self.port}")
+        print("[NamingService] Listening on %s:%d" % (self.host, self.port))
         try:
             while True:
                 conn, _ = self.server_sock.accept()
