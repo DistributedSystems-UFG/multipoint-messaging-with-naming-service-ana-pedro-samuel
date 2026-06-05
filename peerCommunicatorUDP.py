@@ -1,11 +1,15 @@
-from socket import *
-from constMP import *
-import threading
-import random
-import time
-import pickle
+from __future__ import annotations
+
+from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, socket
 import os
-from requests import get
+import pickle
+import random
+import threading
+import time
+import uuid
+
+from constMP import DB_FILE_PREFIX, PEER_TYPE, SERVER_NAME
+from namingService import NamingServiceClient, compose_endpoint, detect_local_ip, split_endpoint
 
 
 class MessageHandler(threading.Thread):
@@ -20,7 +24,7 @@ class MessageHandler(threading.Thread):
         self.handshake_count = 0
         self._lock = threading.Lock()
 
-        self.db_file = f"replica_db_peer_{self.myself}.txt"
+        self.db_file = f"{DB_FILE_PREFIX}{self.myself}.txt"
         self.db: dict[str, str] = {}
         self.applied_log: list[str] = []
 
@@ -156,8 +160,12 @@ class MessageHandler(threading.Thread):
 
 class PeerCommunicator:
     def __init__(self):
+        self.naming_client = NamingServiceClient()
         self.myself: int = -1
-        self.public_ip: str = ""
+        self.service_name: str = f"peer-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self.local_ip: str = detect_local_ip()
+        self.bound_port: int = -1
+
         self.peers: list[str] = []
         self.msg_handler: MessageHandler | None = None
 
@@ -165,48 +173,68 @@ class PeerCommunicator:
 
         self.recv_socket = socket(AF_INET, SOCK_DGRAM)
         self.recv_socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.recv_socket.bind(('0.0.0.0', PEER_UDP_PORT))
 
         self.tcp_server_sock = socket(AF_INET, SOCK_STREAM)
         self.tcp_server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.tcp_server_sock.bind(('0.0.0.0', PEER_TCP_PORT))
-        self.tcp_server_sock.listen(1)
+
+        self._bind_local_sockets()
+
+    def _bind_local_sockets(self):
+        for _ in range(20):
+            tcp_sock = socket(AF_INET, SOCK_STREAM)
+            tcp_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+            tcp_sock.bind(("", 0))
+            port = tcp_sock.getsockname()[1]
+
+            udp_sock = socket(AF_INET, SOCK_DGRAM)
+            udp_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+            try:
+                udp_sock.bind(("", port))
+            except OSError:
+                tcp_sock.close()
+                udp_sock.close()
+                continue
+
+            self.tcp_server_sock = tcp_sock
+            self.recv_socket = udp_sock
+            self.tcp_server_sock.listen(1)
+            self.bound_port = port
+            return
+
+        raise RuntimeError("Unable to bind TCP and UDP sockets to the same local port.")
 
     @staticmethod
-    def get_public_ip() -> str:
-        ip = get('https://api.ipify.org').content.decode('utf8')
-        print(f"[Peer] My public IP address is: {ip}")
-        return ip
+    def _read_all(sock) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+        return b"".join(chunks)
 
-    def _connect_to_group_manager(self) -> socket:
-        sock = socket(AF_INET, SOCK_STREAM)
-        print("[Peer] Connecting to group manager:", (GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT))
-        sock.connect((GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT))
-        return sock
+    def _register_with_naming_service(self):
+        endpoint = compose_endpoint(self.local_ip, self.bound_port)
+        self.naming_client.bind(self.service_name, endpoint)
+        self.naming_client.register(self.service_name, PEER_TYPE)
+        print(f"[Peer] Registered {self.service_name} at {endpoint}")
 
-    def register_with_group_manager(self):
-        self.public_ip = self.get_public_ip()
-        req = {"op": "register", "ipaddr": self.public_ip, "port": PEER_UDP_PORT}
-        with self._connect_to_group_manager() as sock:
-            print("[Peer] Registering with group manager:", req)
-            sock.sendall(pickle.dumps(req))
+    def _get_server_endpoint(self) -> tuple[str, int]:
+        endpoint = self.naming_client.lookup(SERVER_NAME)
+        return split_endpoint(endpoint)
 
-    def get_peer_list(self) -> list[str]:
-        req = {"op": "list"}
-        with self._connect_to_group_manager() as sock:
-            print("[Peer] Getting list of peers from group manager:", req)
-            sock.sendall(pickle.dumps(req))
-            raw = sock.recv(2048)
-        peers = pickle.loads(raw)
-        peers = [p for p in peers if p != self.public_ip]
-        print("[Peer] Got list of peers:", peers)
+    def _get_peer_records(self) -> list[dict[str, str]]:
+        peers = self.naming_client.discover(PEER_TYPE)
+        peers = [peer for peer in peers if peer["nome"] != self.service_name]
+        print("[Peer] Discovered peers:", peers)
         return peers
 
     def send_handshakes(self):
         msg = pickle.dumps(("READY", self.myself))
         for addr in self.peers:
+            host, port = split_endpoint(addr)
             print(f"[Peer {self.myself}] Sending handshake to {addr}")
-            self.send_socket.sendto(msg, (addr, PEER_UDP_PORT))
+            self.send_socket.sendto(msg, (host, port))
 
     def wait_for_all_handshakes(self):
         while self.msg_handler.get_handshake_count() < len(self.peers):
@@ -228,6 +256,8 @@ class PeerCommunicator:
         }
 
     def _submit_operation(self, operation: dict, local_seq: int):
+        server_host, server_port = self._get_server_endpoint()
+
         req = {
             "op": "submit",
             "from": self.myself,
@@ -246,10 +276,10 @@ class PeerCommunicator:
         )
 
         with socket(AF_INET, SOCK_STREAM) as sock:
-            sock.connect((SERVER_ADDR, SERVER_PORT))
+            sock.connect((server_host, server_port))
             sock.sendall(pickle.dumps(req))
-            sock.shutdown(SHUT_WR) 
-            ack = pickle.loads(sock.recv(1024))
+            sock.shutdown(1)
+            ack = pickle.loads(self._read_all(sock))
             print(f"[Peer {self.myself}] Sequencer ack: {ack}")
 
     def send_operations(self, n_ops: int):
@@ -271,6 +301,8 @@ class PeerCommunicator:
         if self.msg_handler is None:
             return
 
+        server_host, server_port = self._get_server_endpoint()
+
         snapshot = self.msg_handler.get_snapshot()
         payload = {
             "op": "final_state",
@@ -282,56 +314,82 @@ class PeerCommunicator:
 
         print(f"[Peer {self.myself}] Sending final replica state to server...")
         with socket(AF_INET, SOCK_STREAM) as sock:
-            sock.connect((SERVER_ADDR, SERVER_PORT))
+            sock.connect((server_host, server_port))
             sock.sendall(pickle.dumps(payload))
-            sock.shutdown(SHUT_WR) 
-            ack = pickle.loads(sock.recv(1024))
+            sock.shutdown(1)
+            ack = pickle.loads(self._read_all(sock))
             print(f"[Peer {self.myself}] Final-state ack: {ack}")
 
-    def run(self):
-        self.register_with_group_manager()
-    
-        while True:
-            print("[Peer] Waiting for signal to start...")
-            self.myself, n_ops = self.wait_to_start()
-            print(f"[Peer {self.myself}] Up. ID={self.myself} | ops per peer={n_ops}")
-    
-            if n_ops == 0:
-                print(f"[Peer {self.myself}] Terminating.")
-                break
-    
-            self.peers = self.get_peer_list()
-    
-            expected_handshakes = len(self.peers)
-            total_expected_messages = (len(self.peers) * n_ops) + 1
-    
-            self.msg_handler = MessageHandler(
-                self.recv_socket,
-                self.myself,
-                expected_handshakes,
-                total_expected_messages,
-            )
-            self.msg_handler.start()
-            print(f"[Peer {self.myself}] Receiver thread started.")
-    
-            self.send_handshakes()
-            print(
-                f"[Peer {self.myself}] Handshakes sent. "
-                f"Current count={self.msg_handler.get_handshake_count()}"
-            )
-    
-            self.wait_for_all_handshakes()
-    
-            print(f"[Peer {self.myself}] Starting operation submission.")
-            self.send_operations(n_ops)
-    
-            print(f"[Peer {self.myself}] All local operations submitted. Waiting for ordered execution to finish...")
-            self.msg_handler.join()
+    def close(self):
+        try:
+            self.naming_client.unbind(self.service_name)
+        except Exception:
+            pass
 
-            time.sleep(0.5)
-            
-            self.send_final_state_to_server()
-            
+        try:
+            self.tcp_server_sock.close()
+        except Exception:
+            pass
+
+        try:
+            self.recv_socket.close()
+        except Exception:
+            pass
+
+        try:
+            self.send_socket.close()
+        except Exception:
+            pass
+
+    def run(self):
+        self._register_with_naming_service()
+
+        try:
+            while True:
+                print("[Peer] Waiting for signal to start...")
+                self.myself, n_ops = self.wait_to_start()
+                print(f"[Peer {self.myself}] Up. ID={self.myself} | ops per peer={n_ops}")
+
+                if n_ops == 0:
+                    print(f"[Peer {self.myself}] Terminating.")
+                    break
+
+                peer_records = self._get_peer_records()
+                self.peers = [peer["endereco"] for peer in peer_records]
+
+                expected_handshakes = len(self.peers)
+                total_expected_messages = (len(self.peers) * n_ops) + 1
+
+                self.msg_handler = MessageHandler(
+                    self.recv_socket,
+                    self.myself,
+                    expected_handshakes,
+                    total_expected_messages,
+                )
+                self.msg_handler.start()
+                print(f"[Peer {self.myself}] Receiver thread started.")
+
+                self.send_handshakes()
+                print(
+                    f"[Peer {self.myself}] Handshakes sent. "
+                    f"Current count={self.msg_handler.get_handshake_count()}"
+                )
+
+                self.wait_for_all_handshakes()
+
+                print(f"[Peer {self.myself}] Starting operation submission.")
+                self.send_operations(n_ops)
+
+                print(f"[Peer {self.myself}] All local operations submitted. Waiting for ordered execution to finish...")
+                self.msg_handler.join()
+
+                time.sleep(0.5)
+
+                self.send_final_state_to_server()
+        finally:
+            self.close()
+
+
 if __name__ == "__main__":
     peer = PeerCommunicator()
     peer.run()

@@ -1,61 +1,98 @@
-from socket import *
+from __future__ import annotations
+
+from socket import AF_INET, SOCK_STREAM, SOCK_DGRAM, SOL_SOCKET, SO_REUSEADDR, socket
 import pickle
-from typing import Optional
-from constMP import *
+import time
+
+from constMP import PEER_TYPE, SERVER_NAME, SERVER_TYPE
+from namingService import NamingServiceClient, compose_endpoint, detect_local_ip, split_endpoint
+
+
+def _read_all(sock) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        data = sock.recv(4096)
+        if not data:
+            break
+        chunks.append(data)
+    return b"".join(chunks)
 
 
 class ComparisonServer:
     def __init__(self):
+        self.naming_client = NamingServiceClient()
+        self.local_ip = detect_local_ip()
+
         self.server_sock = socket(AF_INET, SOCK_STREAM)
         self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-        self.server_sock.bind(('0.0.0.0', SERVER_PORT))
-        self.server_sock.listen(6)
+        self.server_sock.bind(("", 0))
+        self.server_sock.listen(16)
+        self.local_port = self.server_sock.getsockname()[1]
+        self.endpoint = compose_endpoint(self.local_ip, self.local_port)
+
+        self.naming_client.bind(SERVER_NAME, self.endpoint)
+        self.naming_client.register(SERVER_NAME, SERVER_TYPE)
 
         self.udp_sock = socket(AF_INET, SOCK_DGRAM)
         self.sequence_number = 0
-        self.peer_list: list[str] = []
+        self.peer_list: list[dict[str, str]] = []
+        self.expected_peer_count = 0
 
-    def _send_to_group_manager(self, request: dict) -> Optional[bytes]:
-        with socket(AF_INET, SOCK_STREAM) as sock:
-            sock.connect((GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT))
-            sock.sendall(pickle.dumps(request))
-            if request["op"] == "list":
-                return sock.recv(2048)
-        return None
+    def close(self) -> None:
+        try:
+            self.naming_client.unbind(SERVER_NAME)
+        except Exception:
+            pass
 
-    def get_peer_list(self) -> list:
-        raw = self._send_to_group_manager({"op": "list"})
-        peer_list = pickle.loads(raw) if raw else []
-        self.peer_list = peer_list
-        print("[Server] List of Peers:", peer_list)
-        return peer_list
+        try:
+            self.server_sock.close()
+        except Exception:
+            pass
 
-    def stop_group_manager(self):
-        self._send_to_group_manager({"op": "stop"})
+        try:
+            self.udp_sock.close()
+        except Exception:
+            pass
 
-    def start_peers(self, peer_list: list, n_ops: int):
+    def _discover_peers(self) -> list[dict[str, str]]:
+        return self.naming_client.discover(PEER_TYPE)
+
+    def get_peer_list(self, wait: bool = True, poll_interval: float = 1.0) -> list[dict[str, str]]:
+        while True:
+            peers = self._discover_peers()
+            if peers or not wait:
+                self.peer_list = peers
+                self.expected_peer_count = len(peers)
+                print("[Server] Discovered peers:", peers)
+                return peers
+
+            print("[Server] No peers discovered yet. Waiting for registrations...")
+            time.sleep(poll_interval)
+
+    def start_peers(self, peer_list: list[dict[str, str]], n_ops: int) -> None:
         print(f"[Server] Starting {len(peer_list)} peers with {n_ops} operations each...")
-        for peer_number, peer in enumerate(peer_list):
+        for peer_number, peer in enumerate(sorted(peer_list, key=lambda item: item["nome"])):
+            host, port = split_endpoint(peer["endereco"])
             with socket(AF_INET, SOCK_STREAM) as sock:
-                sock.connect((peer, PEER_TCP_PORT))
+                sock.connect((host, port))
                 msg = pickle.dumps((peer_number, n_ops))
                 sock.sendall(msg)
-                response = pickle.loads(sock.recv(512))
-                print(f"[Server] {response}")
+                sock.shutdown(1)
+                response = pickle.loads(_read_all(sock))
+                print(f"[Server] {peer['nome']}: {response}")
 
-    def _broadcast(self, payload: dict):
+    def _broadcast(self, payload: dict) -> None:
         data = pickle.dumps(payload)
         for peer in self.peer_list:
-            self.udp_sock.sendto(data, (peer, PEER_UDP_PORT))
-            
-    def receive_and_sequence_submissions(self, expected_total: int):
+            host, port = split_endpoint(peer["endereco"])
+            self.udp_sock.sendto(data, (host, port))
+
+    def receive_and_sequence_submissions(self, expected_total: int) -> None:
         print(f"[Server] Waiting for {expected_total} submitted operations...")
-    
+
         received = 0
-        self.final_states = {}
-    
-        while received < expected_total or len(self.final_states) < N:
-            conn, addr = self.server_sock.accept()
+        while received < expected_total:
+            conn, _ = self.server_sock.accept()
             try:
                 data = b""
                 while True:
@@ -63,12 +100,12 @@ class ComparisonServer:
                     if not chunk:
                         break
                     data += chunk
-    
+
                 req = pickle.loads(data)
 
                 if req.get("op") == "submit":
                     self.sequence_number += 1
-    
+
                     ordered_msg = {
                         "op": "apply",
                         "seq": self.sequence_number,
@@ -78,45 +115,30 @@ class ComparisonServer:
                         "key": req["key"],
                         "value": req.get("value"),
                     }
-    
+
                     print(
                         f"[Server] seq={self.sequence_number} | "
                         f"peer={req['from']} | local_seq={req['local_seq']} | "
                         f"{req['kind']} {req['key']}"
                         + (f"={req.get('value')}" if req["kind"] == "WRITE" else "")
                     )
-    
+
                     self._broadcast(ordered_msg)
-    
+
                     conn.sendall(pickle.dumps({
                         "status": "ok",
-                        "seq": self.sequence_number
-                    }))
-    
-                    received += 1
-    
-                elif req.get("op") == "final_state":
-                    peer_id = req["peer"]
-                    self.final_states[peer_id] = req
-    
-                    print(
-                        f"[Server] Received final state from peer {peer_id} "
-                        f"with {len(req['db'])} records"
-                    )
-    
-                    conn.sendall(pickle.dumps({
-                        "status": "received"
+                        "seq": self.sequence_number,
                     }))
 
+                    received += 1
+
                 else:
-                    conn.sendall(pickle.dumps({
-                        "status": "ignored"
-                    }))
-    
+                    conn.sendall(pickle.dumps({"status": "ignored"}))
+
             finally:
                 conn.close()
-            
-    def broadcast_end_marker(self):
+
+    def broadcast_end_marker(self) -> None:
         self.sequence_number += 1
         end_msg = {
             "op": "apply",
@@ -130,7 +152,7 @@ class ComparisonServer:
         print(f"[Server] Broadcasting END marker as seq={self.sequence_number}")
         self._broadcast(end_msg)
 
-    def collect_final_states(self, expected_count: int) -> list:
+    def collect_final_states(self, expected_count: int) -> list[dict]:
         states = []
         print(f"[Server] Waiting for final states from {expected_count} peers...")
 
@@ -143,20 +165,23 @@ class ComparisonServer:
                     if not chunk:
                         break
                     data += chunk
-                
+
                 state = pickle.loads(data)
-                states.append(state)
-                print(
-                    f"[Server] Received final state from peer {state['peer']} "
-                    f"with {len(state['db'])} records"
-                )
-                conn.sendall(pickle.dumps({"status": "received"}))
+                if state.get("op") == "final_state":
+                    states.append(state)
+                    print(
+                        f"[Server] Received final state from peer {state['peer']} "
+                        f"with {len(state['db'])} records"
+                    )
+                    conn.sendall(pickle.dumps({"status": "received"}))
+                else:
+                    conn.sendall(pickle.dumps({"status": "ignored"}))
             finally:
                 conn.close()
 
         return states
 
-    def compare_final_states(self, states: list):
+    def compare_final_states(self, states: list[dict]) -> None:
         if not states:
             print("[Server] No final states received.")
             return
@@ -181,27 +206,28 @@ class ComparisonServer:
         return int(input("Enter the number of operations for each peer to submit (0 to terminate)=> "))
 
     def run(self):
-        while True:
-            n_ops = self.prompt_user()
-            peer_list = self.get_peer_list()
-            self.start_peers(peer_list, n_ops)
+        try:
+            while True:
+                n_ops = self.prompt_user()
+                peer_list = self.get_peer_list(wait=(n_ops != 0))
+                self.start_peers(peer_list, n_ops)
 
-            if n_ops != 0:
-                expected_total = len(peer_list) * n_ops
-                print("[Server] Peers started. Sequencing commands now...")
+                if n_ops != 0:
+                    expected_total = len(peer_list) * n_ops
+                    print("[Server] Peers started. Sequencing commands now...")
 
-                self.sequence_number = 0
+                    self.sequence_number = 0
 
-                self.receive_and_sequence_submissions(expected_total)
-                self.broadcast_end_marker()
+                    self.receive_and_sequence_submissions(expected_total)
+                    self.broadcast_end_marker()
 
-                states = list(self.final_states.values())
-                self.compare_final_states(states)
-            else:
-                print("[Server] Stopping.")
-                self.server_sock.close()
-                self.stop_group_manager()
-                break
+                    states = self.collect_final_states(len(peer_list))
+                    self.compare_final_states(states)
+                else:
+                    print("[Server] Stopping.")
+                    break
+        finally:
+            self.close()
 
 
 if __name__ == "__main__":
